@@ -12,12 +12,44 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem
 
-# 彻底静默日志，防止泄露
+# 1. 配置日志静默（防止封号关键）
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
 logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
 logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
+# 2. 定义静态伪装页面模板（提取出来防止语法错误）
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>EcoGuard Monitor</title>
+    <style>
+        body { background-color: #0f172a; color: #94a3b8; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .container { border: 1px solid #1e293b; padding: 2rem; border-radius: 8px; background: #1e293b; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); width: 80%; max-width: 600px; }
+        h1 { color: #10b981; font-size: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
+        .stat-row { display: flex; justify-content: space-between; margin: 0.5rem 0; }
+        .status { color: #10b981; }
+        .blink { animation: blinker 2s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+        .footer { margin-top: 2rem; font-size: 0.8rem; text-align: center; color: #475569; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Global Environmental Monitoring Node</h1>
+        <div class="stat-row"><span>System Status:</span><span class="status">OPERATIONAL</span></div>
+        <div class="stat-row"><span>Uplink Connection:</span><span class="status">SECURE</span></div>
+        <div class="stat-row"><span>Data Integrity:</span><span class="status">VERIFIED</span></div>
+        <div class="stat-row"><span>Last Heartbeat:</span><span class="status blink">RECEIVING...</span></div>
+        <div class="footer">Node ID: HK-99-ALPHA | Protected by EcoGuard Initiative</div>
+    </div>
+</body>
+</html>
+"""
+
+# 3. 核心逻辑类
 class SystemKernel:
     def __init__(self, u_id, d_set, k_val):
         self.u = u_id
@@ -27,7 +59,7 @@ class SystemKernel:
         self.root = f"datasets/{self.r_id}"
 
     def _p(self, p: str) -> str:
-        # 路径清洗，防止特殊字符导致路径错误
+        # 路径清洗
         c = unquote(p).strip('/')
         if '..' in c or c.startswith('/'):
             raise HTTPException(status_code=400)
@@ -67,7 +99,7 @@ class SystemKernel:
         except Exception:
             pass
 
-    # 核心修复：支持 Range Seek 的流生成器
+    # AList 修复关键：支持 Range Seek 的流生成器
     def r_stream(self, p: str, start: int = 0, length: Optional[int] = None, cs: int = 8192) -> Generator[bytes, None, None]:
         try:
             with self.fs.open(p, 'rb') as f:
@@ -85,13 +117,11 @@ class SystemKernel:
                     if remaining != float('inf'):
                         remaining -= len(c)
         except Exception:
-            # 发生流错误时静默结束，防止抛出 500 导致连接重置
             pass
 
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
         try:
-            # 必须在线程池运行，防止阻塞
             i = await run_in_threadpool(self.fs.info, fp)
         except FileNotFoundError:
             return Response(status_code=404)
@@ -156,7 +186,7 @@ class SystemKernel:
             last_mod = self._t(i.get('last_modified'))
             file_name = quote(os.path.basename(p))
             
-            # 处理 Range 头 (AList/浏览器预览关键逻辑)
+            # AList Range 头处理
             range_header = req.headers.get("range")
             start, end = 0, file_size - 1
             status_code = 200
@@ -170,13 +200,12 @@ class SystemKernel:
                         start = int(r_start) if r_start else 0
                         if r_end:
                             end = int(r_end)
-                        # 修正长度
                         if start >= file_size:
-                            return Response(status_code=416) # Range Not Satisfiable
+                            return Response(status_code=416)
                         content_length = end - start + 1
-                        status_code = 206 # Partial Content
+                        status_code = 206
                 except Exception:
-                    pass # 如果 Range 解析失败，降级为全量下载
+                    pass
 
             headers = {
                 "Content-Disposition": f"attachment; filename*=UTF-8''{file_name}",
@@ -229,12 +258,11 @@ class SystemKernel:
 
             await run_in_threadpool(self._chk, df)
             
-            # 使用更安全的流式复制
             def _core():
                 with self.fs.open(sf, 'rb') as f1:
                     with self.fs.open(df, 'wb') as f2:
                         while True:
-                            b = f1.read(1024 * 1024) # 1MB Chunk
+                            b = f1.read(1024 * 1024)
                             if not b: break
                             f2.write(b)
             
@@ -266,32 +294,46 @@ class SystemKernel:
         x = f"""<?xml version="1.0" encoding="utf-8" ?><D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth><D:owner><D:href>SysAdmin</D:href></D:owner><D:timeout>Second-3600</D:timeout><D:locktoken><D:href>{t}</D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>"""
         return Response(content=x, status_code=200, media_type="application/xml; charset=utf-8", headers={"Lock-Token": f"<{t}>"})
 
+# 4. FastAPI 应用入口
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 @app.get("/")
 async def sys_status():
-    return HTMLResponse("""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>EcoGuard Monitor</title>
-        <style>
-            body { background-color: #0f172a; color: #94a3b8; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-            .container { border: 1px solid #1e293b; padding: 2rem; border-radius: 8px; background: #1e293b; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); width: 80%; max-width: 600px; }
-            h1 { color: #10b981; font-size: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
-            .stat-row { display: flex; justify-content: space-between; margin: 0.5rem 0; }
-            .status { color: #10b981; }
-            .blink { animation: blinker 2s linear infinite; }
-            @keyframes blinker { 50% { opacity: 0; } }
-            .footer { margin-top: 2rem; font-size: 0.8rem; text-align: center; color: #475569; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Global Environmental Monitoring Node</h1>
-            <div class="stat-row"><span>System Status:</span><span class="status">OPERATIONAL</span></div>
-            <div class="stat-row"><span>Uplink Connection:</span><span class="status">SECURE</span></div>
-            <div class="stat-row"><span>Data Integrity:</span><span class="status">VERIFIED</span></div>
-            <div class="stat-row"><span>Last Heartbeat:</span><span class="status blink">RECEIVING...</span></div>
-            <div class="footer">Node ID:
+    return HTMLResponse(content=HTML_TEMPLATE)
+
+@app.api_route("/{p:path}", methods=["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"])
+async def traffic_handler(req: Request, p: str = ""):
+    m = req.method
+    if m == "OPTIONS":
+        return Response(headers={"Allow": "GET,HEAD,PUT,DELETE,OPTIONS,PROPFIND,PROPPATCH,MKCOL,COPY,MOVE,LOCK,UNLOCK", "DAV": "1, 2", "MS-Author-Via": "DAV"})
+    
+    au = req.headers.get("Authorization")
+    if not au or not au.startswith("Basic "):
+        return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="System Access"'})
+
+    try:
+        dec = base64.b64decode(au[6:]).decode()
+        if ":" not in dec: raise Exception()
+        ur, tk = dec.split(":", 1)
+        u, d = ur.split("/", 1) if "/" in ur else ("user", "default")
+        
+        ker = SystemKernel(u, d, tk)
+
+        if m == "PROPFIND": return await ker.op_sync(p, req.headers.get("Depth", "1"))
+        elif m in ["GET", "HEAD"]: return await ker.op_down(p, req)
+        elif m == "PUT": return await ker.op_up(p, req)
+        elif m == "MKCOL": return await ker.op_mk(p)
+        elif m == "DELETE": return await ker.op_del(p)
+        elif m == "MOVE": return await ker.op_mv_cp(p, req.headers.get("Destination"), True)
+        elif m == "COPY": return await ker.op_mv_cp(p, req.headers.get("Destination"), False)
+        elif m == "LOCK": return await ker.op_lk()
+        elif m == "UNLOCK": return Response(status_code=204)
+        elif m == "PROPPATCH": return Response(status_code=200)
+        else: return Response(status_code=405)
+    except Exception:
+        return Response(status_code=500)
+
+if __name__ == "__main__":
+    import uvicorn
+    # 日志级别设为 critical
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
