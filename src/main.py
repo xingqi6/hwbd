@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem
 
-# 1. 依然保持日志静默，但允许 python 内部错误抛出
+# 1. 依然保持日志静默
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
@@ -51,7 +51,6 @@ class SystemKernel:
         self.u = u_id
         self.d = d_set
         self.r_id = f"{u_id}/{d_set}"
-        # 这里的 token 用于鉴权，如果是跨账号，必须确保该 token 对 r_id 有读写权限
         self.fs = HfFileSystem(token=k_val)
         self.root = f"datasets/{self.r_id}"
 
@@ -64,14 +63,23 @@ class SystemKernel:
     def _e(self, p: str) -> str:
         return quote(p)
 
+    # 【核心修复】增强了时间格式化函数，防止 NoneType 报错
     def _t(self, t) -> str:
-        if isinstance(t, (int, float)):
+        # 如果获取到的时间是 None，直接赋予当前时间
+        if t is None:
+            t = datetime.now(timezone.utc)
+        elif isinstance(t, (int, float)):
             t = datetime.fromtimestamp(t, tz=timezone.utc)
         elif isinstance(t, str):
             try:
                 t = datetime.fromisoformat(t.replace("Z", "+00:00"))
             except ValueError:
                 t = datetime.now(timezone.utc)
+        
+        # 此时 t 必然是 datetime 对象（除非外部传入了奇怪的类型，但也比 None 强）
+        if not isinstance(t, datetime):
+             t = datetime.now(timezone.utc)
+             
         return t.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
     def _chk(self, fp: str):
@@ -115,13 +123,11 @@ class SystemKernel:
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
         try:
-            # PROPFIND 列表前刷新缓存
             await run_in_threadpool(self._flush, fp)
             i = await run_in_threadpool(self.fs.info, fp)
         except FileNotFoundError:
             return Response(status_code=404)
         except Exception as e:
-            # 返回错误详情以便调试
             return Response(status_code=500, content=f"LS Error: {str(e)}")
 
         fls = []
@@ -161,7 +167,9 @@ class SystemKernel:
             
             ET.SubElement(pr, "{DAV:}getcontenttype").text = ct
             ET.SubElement(pr, "{DAV:}displayname").text = os.path.basename(rp) if rp else "/"
-            ET.SubElement(pr, "{DAV:}getlastmodified").text = self._t(f.get('last_modified') or datetime.now(timezone.utc))
+            
+            # 使用修复后的 _t 方法，安全处理时间
+            ET.SubElement(pr, "{DAV:}getlastmodified").text = self._t(f.get('last_modified'))
             
             if f['type'] != 'directory':
                 ET.SubElement(pr, "{DAV:}getcontentlength").text = str(f.get('size', 0))
@@ -174,13 +182,13 @@ class SystemKernel:
     async def op_down(self, p: str, req: Request) -> Response:
         fp = self._p(p)
         try:
-            # 下载前强制清除该文件缓存，确保获取最新状态
             await run_in_threadpool(self._flush, fp)
             
             i = await run_in_threadpool(self.fs.info, fp)
             if i['type'] == 'directory': return Response(status_code=404)
             
             file_size = i['size']
+            # 这里调用 _t，如果 i['last_modified'] 是 None，现在不会报错了
             last_mod = self._t(i.get('last_modified'))
             file_name = quote(os.path.basename(p))
             
@@ -221,7 +229,6 @@ class SystemKernel:
         except FileNotFoundError:
             return Response(status_code=404)
         except Exception as e:
-            # 关键修改：将具体的错误信息返回到 Body 中
             error_msg = f"Download Error: {str(e)} | Path: {fp}"
             return Response(status_code=500, content=error_msg)
 
@@ -232,7 +239,6 @@ class SystemKernel:
             with self.fs.open(fp, 'wb') as f:
                 async for chunk in req.stream():
                     f.write(chunk)
-            # 上传后清除父目录缓存
             await run_in_threadpool(self._flush, os.path.dirname(fp))
             return Response(status_code=201)
         except Exception as e:
