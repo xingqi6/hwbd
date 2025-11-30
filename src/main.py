@@ -12,13 +12,10 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem
 
-# 1. 配置日志静默（防止封号关键）
+# 1. 依然保持日志静默，但允许 python 内部错误抛出
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
-# 2. 定义静态伪装页面模板（提取出来防止语法错误）
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -49,17 +46,16 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# 3. 核心逻辑类
 class SystemKernel:
     def __init__(self, u_id, d_set, k_val):
         self.u = u_id
         self.d = d_set
         self.r_id = f"{u_id}/{d_set}"
+        # 这里的 token 用于鉴权，如果是跨账号，必须确保该 token 对 r_id 有读写权限
         self.fs = HfFileSystem(token=k_val)
         self.root = f"datasets/{self.r_id}"
 
     def _p(self, p: str) -> str:
-        # 路径清洗
         c = unquote(p).strip('/')
         if '..' in c or c.startswith('/'):
             raise HTTPException(status_code=400)
@@ -92,14 +88,11 @@ class SystemKernel:
 
     def _flush(self, p: str):
         try:
-            if hasattr(self.fs, 'invalidate_cache'):
-                self.fs.invalidate_cache(p)
-            if hasattr(self.fs, 'clear_instance_cache'):
-                self.fs.clear_instance_cache()
+            self.fs.invalidate_cache(p)
+            self.fs.clear_instance_cache()
         except Exception:
             pass
 
-    # AList 修复关键：支持 Range Seek 的流生成器
     def r_stream(self, p: str, start: int = 0, length: Optional[int] = None, cs: int = 8192) -> Generator[bytes, None, None]:
         try:
             with self.fs.open(p, 'rb') as f:
@@ -122,11 +115,14 @@ class SystemKernel:
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
         try:
+            # PROPFIND 列表前刷新缓存
+            await run_in_threadpool(self._flush, fp)
             i = await run_in_threadpool(self.fs.info, fp)
         except FileNotFoundError:
             return Response(status_code=404)
-        except Exception:
-            return Response(status_code=500)
+        except Exception as e:
+            # 返回错误详情以便调试
+            return Response(status_code=500, content=f"LS Error: {str(e)}")
 
         fls = []
         if i['type'] == 'directory':
@@ -142,7 +138,6 @@ class SystemKernel:
             fls = [i]
 
         r = ET.Element("{DAV:}multistatus", {"xmlns:D": "DAV:"})
-
         for f in fls:
             n = f['name']
             rp = n[len(self.root):].strip('/')
@@ -179,6 +174,9 @@ class SystemKernel:
     async def op_down(self, p: str, req: Request) -> Response:
         fp = self._p(p)
         try:
+            # 下载前强制清除该文件缓存，确保获取最新状态
+            await run_in_threadpool(self._flush, fp)
+            
             i = await run_in_threadpool(self.fs.info, fp)
             if i['type'] == 'directory': return Response(status_code=404)
             
@@ -186,7 +184,6 @@ class SystemKernel:
             last_mod = self._t(i.get('last_modified'))
             file_name = quote(os.path.basename(p))
             
-            # AList Range 头处理
             range_header = req.headers.get("range")
             start, end = 0, file_size - 1
             status_code = 200
@@ -223,8 +220,10 @@ class SystemKernel:
             )
         except FileNotFoundError:
             return Response(status_code=404)
-        except Exception:
-            return Response(status_code=500)
+        except Exception as e:
+            # 关键修改：将具体的错误信息返回到 Body 中
+            error_msg = f"Download Error: {str(e)} | Path: {fp}"
+            return Response(status_code=500, content=error_msg)
 
     async def op_up(self, p: str, req: Request) -> Response:
         fp = self._p(p)
@@ -233,10 +232,11 @@ class SystemKernel:
             with self.fs.open(fp, 'wb') as f:
                 async for chunk in req.stream():
                     f.write(chunk)
+            # 上传后清除父目录缓存
             await run_in_threadpool(self._flush, os.path.dirname(fp))
             return Response(status_code=201)
-        except Exception:
-            return Response(status_code=500)
+        except Exception as e:
+            return Response(status_code=500, content=f"Upload Error: {str(e)}")
 
     async def op_del(self, p: str) -> Response:
         fp = self._p(p)
@@ -267,9 +267,7 @@ class SystemKernel:
                             f2.write(b)
             
             await run_in_threadpool(_core)
-            
             if mv: await run_in_threadpool(self.fs.rm, sf, recursive=True)
-            
             await run_in_threadpool(self._flush, os.path.dirname(sf))
             await run_in_threadpool(self._flush, os.path.dirname(df))
             return Response(status_code=201)
@@ -294,7 +292,6 @@ class SystemKernel:
         x = f"""<?xml version="1.0" encoding="utf-8" ?><D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth><D:owner><D:href>SysAdmin</D:href></D:owner><D:timeout>Second-3600</D:timeout><D:locktoken><D:href>{t}</D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>"""
         return Response(content=x, status_code=200, media_type="application/xml; charset=utf-8", headers={"Lock-Token": f"<{t}>"})
 
-# 4. FastAPI 应用入口
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 @app.get("/")
@@ -331,9 +328,8 @@ async def traffic_handler(req: Request, p: str = ""):
         elif m == "PROPPATCH": return Response(status_code=200)
         else: return Response(status_code=405)
     except Exception:
-        return Response(status_code=500)
+        return Response(status_code=500, content="Handler Init Error")
 
 if __name__ == "__main__":
     import uvicorn
-    # 日志级别设为 critical
     uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
